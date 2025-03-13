@@ -1,0 +1,95 @@
+version: '3.8'
+services:
+  app:
+    build:
+      context: ./src/DockerAppDemo
+      dockerfile_inline: |
+        FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+        WORKDIR /App
+        EXPOSE 7071
+        EXPOSE 10254
+        COPY . ./
+        RUN dotnet restore
+        RUN dotnet publish -o out
+        FROM mcr.microsoft.com/dotnet/aspnet:9.0
+        WORKDIR /App
+        COPY --from=build /App/out .
+        ENTRYPOINT ["./DockerAppDemo"]
+    environment:
+      ASPNETCORE_URLS: "https://+:7071;http://+:10254"
+
+      # 如果使用 https 要加以下這些 ref: https://learn.microsoft.com/en-us/aspnet/core/security/docker-compose-https?view=aspnetcore-8.0
+      ASPNETCORE_Kestrel__Certificates__Default__Path: "/https/aspnetapp.pfx"
+      ASPNETCORE_Kestrel__Certificates__Default__Password: "abc123"
+    volumes:
+      - ~/.aspnet/https:/https:ro
+
+    ports:
+      - '7071:7071'
+      - '10254:10254'
+
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    container_name: prometheus
+    configs:
+      - source: prometheus.yaml
+        target: /etc/prometheus/prometheus.yaml
+    volumes:
+      - ./Docker-data-volumes/prometheus:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yaml'
+      - '--web.enable-otlp-receiver'
+    ports:
+      - '9090:9090'
+
+  renderer:
+    image: grafana/grafana-image-renderer:3.12.2
+    environment:
+      BROWSER_TZ: Asia/Taipei
+    ports:
+      - '8081:8081'
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    container_name: grafana
+    configs:
+      - source: grafana_datasources.yaml
+        target: /etc/grafana/provisioning/datasources/datasources.yaml
+    volumes:
+      - ./Docker-data-volumes/grafana:/var/lib/grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: grafana-admin
+      GF_RENDERING_SERVER_URL: http://renderer:8081/render
+      GF_RENDERING_CALLBACK_URL: http://grafana:3000/
+      GF_LOG_FILTERS: rendering:debug
+    depends_on:
+      - prometheus
+      - renderer
+    ports:
+      - '3000:3000'
+
+configs:
+  prometheus.yaml:
+    content: |
+      scrape_configs:
+      - job_name: 'dotnet-app'
+        scrape_interval: 1s # 展示用環境刻意將查詢間隔條短
+        scheme: http # app 的 /metrics API 如果使用 https 要加這個
+        tls_config:
+          insecure_skip_verify: true # docker 當中的 app 如果使用 https 要加這個
+        static_configs:
+          - targets: ['host.docker.internal:10254'] # docker 當中的 app host 需用 'host.docker.internal'
+
+  grafana_datasources.yaml:
+    content: |
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          url: http://host.docker.internal:9090 # docker 當中的 app host 需用 'host.docker.internal'
+          access: proxy
+          isDefault: true
+          jsonData:
+            timeInterval: "3s" # 展示用環境刻意將查詢間隔條短
+            queryTimeout: "10s"
