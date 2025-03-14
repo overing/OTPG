@@ -14,6 +14,7 @@ services:
         FROM mcr.microsoft.com/dotnet/aspnet:9.0
         WORKDIR /App
         COPY --from=build /App/out .
+        RUN apt update && apt install -y wget && wget -O dotnet-dump https://aka.ms/dotnet-dump/linux-x64 && chmod +x dotnet-dump
         ENTRYPOINT ["./DockerAppDemo"]
     environment:
       ASPNETCORE_URLS: "https://+:7071;http://+:10254"

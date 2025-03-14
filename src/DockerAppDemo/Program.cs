@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using Microsoft.AspNetCore.Mvc;
@@ -28,6 +29,9 @@ appBuilder.Services
 #endregion
 
 appBuilder.Services
+    .AddSingleton<ConcurrentQueue<string>>();
+
+appBuilder.Services
     .AddHostedService(p => p.GetRequiredService<FakeAccess>())
     .AddHttpClient<FakeAccess>(client => client.BaseAddress = new("http://localhost:10254/"));
 
@@ -51,12 +55,31 @@ app.MapGet("/action", async ([FromServices] IAppMetrics metrics) =>
 
 #region 在需要的位置對 Counter 進行操作
 
-    metrics.IncrementRequestCount();
+    metrics.IncrementRequestCount("/action");
     metrics.LogRequestHandleTime("/action", sw.ElapsedMilliseconds);
 
 #endregion
 
     return result;
+});
+
+app.MapPost("/enqueue", ([FromServices] IAppMetrics metrics, [FromServices] ConcurrentQueue<string> queue, [FromBody] ushort count = 256) =>
+{
+    var sw = Stopwatch.StartNew();
+
+    for (var i = 0; i < count; i++)
+    {
+        queue.Enqueue(Guid.NewGuid().ToString("N"));
+    }
+
+#region 在需要的位置對 Counter 進行操作
+
+    metrics.IncrementRequestCount("/enqueue");
+    metrics.LogRequestHandleTime("/enqueue", sw.ElapsedMilliseconds);
+
+#endregion
+
+    return Results.Ok($"enqueue guids x{count} done");
 });
 
 await app.RunAsync();
@@ -73,14 +96,14 @@ sealed class AppMetrics : IAppMetrics
         _elapsedMs = meter.CreateGauge<long>(name: "request.elapsed_time", unit: "ms");
     }
 
-    public void IncrementRequestCount() => _request.Add(1);
+    public void IncrementRequestCount(string name) => _request.Add(1, [new("action", name)]);
 
     public void LogRequestHandleTime(string name, long ms) => _elapsedMs.Record(ms, [new("action", name)]);
 }
 
 interface IAppMetrics
 {
-    void IncrementRequestCount();
+    void IncrementRequestCount(string name);
     void LogRequestHandleTime(string name, long ms);
 }
 
