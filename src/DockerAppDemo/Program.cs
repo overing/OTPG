@@ -14,8 +14,6 @@ var app = appBuilder.Build();
 app.MapOpenApi();
 app.MapScalarApiReference();
 
-app.MapGet("/", () => Results.Redirect("~/scalar/v1"));
-
 app.MapPost("/enqueue", ([FromServices] ConcurrentQueue<MyData> queue, [FromBody] ushort count) =>
 {
     var sw = Stopwatch.StartNew();
