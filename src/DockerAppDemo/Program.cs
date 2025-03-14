@@ -31,9 +31,9 @@ appBuilder.Services
 appBuilder.Services
     .AddSingleton<ConcurrentQueue<string>>();
 
-appBuilder.Services
-    .AddHostedService(p => p.GetRequiredService<FakeAccess>())
-    .AddHttpClient<FakeAccess>(client => client.BaseAddress = new("http://localhost:10254/"));
+// appBuilder.Services
+//     .AddHostedService(p => p.GetRequiredService<FakeAccess>())
+//     .AddHttpClient<FakeAccess>(client => client.BaseAddress = new("http://localhost:10254/"));
 
 var app = appBuilder.Build();
 
