@@ -8,6 +8,7 @@ services:
         WORKDIR /App
         EXPOSE 7071
         EXPOSE 10254
+        EXPOSE 10255
         COPY . ./
         RUN dotnet restore
         RUN dotnet publish -c Release -o out
@@ -27,6 +28,7 @@ services:
     ports:
       - '7071:7071'
       - '10254:10254'
+      - '10255:10255'
 
   prometheus:
     image: prom/prometheus:v3.2.1
@@ -79,7 +81,7 @@ configs:
         tls_config:
           insecure_skip_verify: true # docker 當中的 app 如果使用 https 要加這個
         static_configs:
-          - targets: ['host.docker.internal:10254'] # docker 當中的 app host 需用 'host.docker.internal'
+          - targets: ['host.docker.internal:10254', 'host.docker.internal:10255'] # docker 當中的 app host 需用 'host.docker.internal'
 
   grafana_datasources.yaml:
     content: |
