@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Diagnostics.Runtime;
@@ -11,7 +12,7 @@ using Scalar.AspNetCore;
 if (args.Contains("--heap-capture"))
 {
     Environment.SetEnvironmentVariable("ASPNETCORE_URLS", "http://+:10255");
-    Environment.SetEnvironmentVariable("ASPNETCORE_ApplicationName", "DockerAppDemo-hc");
+    Environment.SetEnvironmentVariable("ASPNETCORE_ApplicationName", Assembly.GetExecutingAssembly().GetName().Name + "-hc");
 
     var hcBuilder = WebApplication.CreateBuilder(args);
     hcBuilder.Logging.ClearProviders().AddSimpleConsole();
@@ -51,6 +52,8 @@ appBuilder.Services
 
 #endregion
 
+appBuilder.Services.AddHostedService<CaptureProcessHolder>();
+
 appBuilder.Services
     .AddHostedService(p => p.GetRequiredService<FakeAccess>())
     .AddHttpClient<FakeAccess>(client => client.BaseAddress = new("http://localhost:10254/"));
@@ -83,13 +86,6 @@ app.MapGet("/action", async ([FromServices] IAppMetrics metrics) =>
     return result;
 });
 
-app.Services.GetRequiredService<IHostApplicationLifetime>().ApplicationStarted.Register(() =>
-{
-    var pid = Environment.ProcessId;
-    app.Services.GetRequiredService<ILogger<Program>>().LogInformation("Main Process Id: {pid}", pid);
-    Process.Start(startInfo: new("DockerAppDemo", ["--heap-capture"]));
-});
-
 await app.RunAsync();
 
 sealed class AppMetrics : IAppMetrics
@@ -98,6 +94,7 @@ sealed class AppMetrics : IAppMetrics
     private readonly Gauge<long> _elapsedMs;
     private readonly Gauge<long> _objectCount;
     private readonly Gauge<double> _objectSize;
+    private readonly Gauge<long> _captureMs;
 
     public AppMetrics(IHostEnvironment hostEnvironment, IMeterFactory meterFactory)
     {
@@ -106,6 +103,7 @@ sealed class AppMetrics : IAppMetrics
         _elapsedMs = meter.CreateGauge<long>(name: "request.elapsed_time", unit: "ms");
         _objectCount = meter.CreateGauge<long>(name: "obj.count");
         _objectSize = meter.CreateGauge<double>(name: "obj.size", unit: "byte");
+        _captureMs = meter.CreateGauge<long>(name: "obj.elapsed_time", unit: "ms");
     }
 
     public void IncrementRequestCount(string name) => _request.Add(1, [new("action", name)]);
@@ -118,6 +116,8 @@ sealed class AppMetrics : IAppMetrics
         _objectCount.Record(count, tags);
         _objectSize.Record(size, tags);
     }
+
+    public void LogCaptureTime(long ms) => _captureMs.Record(ms);
 }
 
 interface IAppMetrics
@@ -125,6 +125,7 @@ interface IAppMetrics
     void IncrementRequestCount(string name);
     void LogRequestHandleTime(string name, long ms);
     void LogHeapObject(string name, uint count, ulong size);
+    void LogCaptureTime(long ms);
 }
 
 sealed class FakeAccess(HttpClient client) : BackgroundService
@@ -140,12 +141,29 @@ sealed class FakeAccess(HttpClient client) : BackgroundService
     }
 }
 
-sealed class HeapInfoCapture(ILogger<HeapInfoCapture> logger, IHostEnvironment hostEnvironment, IAppMetrics appMetrics) : BackgroundService
+sealed class CaptureProcessHolder : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        logger.LogInformation(nameof(ExecuteAsync));
+        var pid = Environment.ProcessId;
 
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            using var subprocess = Process.Start(startInfo: new("DockerAppDemo", ["--heap-capture"]))!;
+            await subprocess.WaitForExitAsync(stoppingToken);
+
+            if (subprocess.ExitCode == 0)
+            {
+                continue;
+            }
+        }
+    }
+}
+
+sealed class HeapInfoCapture(IHostEnvironment hostEnvironment, IAppMetrics appMetrics) : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
         var cd = hostEnvironment.ContentRootPath;
         var executor = Path.Combine(cd, "dotnet-dump");
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
@@ -154,12 +172,13 @@ sealed class HeapInfoCapture(ILogger<HeapInfoCapture> logger, IHostEnvironment h
         }
         if (!File.Exists(executor))
         {
-            var rid = RuntimeInformation.RuntimeIdentifier;
-            var url = $"https://aka.ms/dotnet-dump/{rid}";
-            using var httpClient = new HttpClient();
-            using var download = await httpClient.GetStreamAsync(url, stoppingToken);
-            using var loaclfile = File.OpenWrite(executor);
-            await download.CopyToAsync(loaclfile, stoppingToken);
+            var url = $"https://aka.ms/dotnet-dump/{RuntimeInformation.RuntimeIdentifier}";
+            using (var httpClient = new HttpClient())
+            using (var download = await httpClient.GetStreamAsync(url, stoppingToken))
+            using (var loaclfile = File.OpenWrite(executor))
+            {
+                await download.CopyToAsync(loaclfile, stoppingToken);
+            }
 
             if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
@@ -168,89 +187,61 @@ sealed class HeapInfoCapture(ILogger<HeapInfoCapture> logger, IHostEnvironment h
             }
         }
 
+        uint dataCount;
         while (!stoppingToken.IsCancellationRequested)
         {
             await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
 
-            // logger.LogInformation("Capture heap");
+            var vsw = ValueStopwatch.StartNew();
 
             var dumpname = $"{DateTime.Now:yyyyMMdd-HHmmss}.dmp";
             var dumpfile = Path.Combine(cd, dumpname);
 
-            using var collect = Process.Start(startInfo: new(executor, ["collect", "-o", dumpfile, "-p", "1"]))!;
-            await collect.WaitForExitAsync(stoppingToken);
+            using (var collect = Process.Start(startInfo: new(executor, ["collect", "-o", dumpfile, "-p", "1"]))!)
+            {
+                await collect.WaitForExitAsync(stoppingToken);
+            }
 
-            var datas = CaptureObjectCountAndSize(dumpfile);
-            logger.LogInformation("Capture heap: x{count}", datas.Count);
-
+            dataCount = 0;
+            using (var target = DataTarget.LoadDump(dumpfile))
+            using (var runtime = target.ClrVersions[0].CreateRuntime())
+            {
+                var groups = runtime.Heap.EnumerateObjects()
+                    .Where(o => o.Type?.Name is { } name && IsTargetName(name))
+                    .GroupBy(o => o.Type!.Name!);
+                foreach (var group in groups)
+                {
+                    ulong totalSize = 0;
+                    uint count = 0;
+                    foreach (var obj in group)
+                    {
+                        totalSize += obj.Size;
+                        ++count;
+                    }
+                    appMetrics.LogHeapObject(group.Key, count, totalSize);
+                    dataCount++;
+                }
+            }
             File.Delete(dumpfile);
 
-            foreach (var data in datas)
-            {
-                appMetrics.LogHeapObject(data.Key, data.Value.Count, data.Value.Size);
-            }
-        }
-    }
-
-    static Dictionary<string, (ulong Size, uint Count)> CaptureObjectCountAndSize(string dumpFile)
-    {
-        using var target = DataTarget.LoadDump(dumpFile);
-        using var runtime = target.ClrVersions[0].CreateRuntime();
-        return runtime.Heap.EnumerateObjects()
-            .Where(o => o.Type?.Name is { } name && IsTargetName(name))
-            .GroupBy(o => o.Type!.Name!)
-            .Select(Summary)
-            .ToDictionary(i => i.Type, i => (i.Size, i.Count));
-
-        static (string Type, ulong Size, uint Count) Summary(IGrouping<string, ClrObject> objGroup)
-        {
-            ulong totalSize = 0;
-            uint count = 0;
-            foreach (var obj in objGroup)
-            {
-                totalSize += obj.Size;
-                ++count;
-            }
-            return (Type: objGroup.Key, Size: totalSize, Count: count);
+            var elapsed = (long)vsw.GetElapsedTime().TotalMilliseconds;
+            appMetrics.LogCaptureTime(elapsed);
         }
     }
 
     static readonly string[] IgnorePrefix = [
         "<>",
+
         "Internal.",
         "Interop+",
 
-        "Microsoft.AspNetCore.",
-        "Microsoft.Diagnostics.",
-        "Microsoft.Extensions.",
-        "Microsoft.Win32.",
+        "Microsoft.",
 
         "OpenTelemetry.",
 
-        "System.Action<",
-        "System.Buffers.",
-        "System.Collections.",
-        "System.Comparison<",
-        "System.Diagnostics.",
-        "System.Dynamic.",
-        "System.Formats.",
-        "System.Func<",
-        "System.Globalization.",
-        "System.IO.FileSystemWatcher+",
-        "System.IO.Pipelines.",
-        "System.Lazy<",
-        "System.Linq.",
-        "System.Net.",
-        "System.Reflection.",
-        "System.Resources.",
-        "System.Runtime.",
-        "System.RuntimeType",
-        "System.Security.",
-        "System.SZ",
-        "System.Text.",
-        "System.Threading.",
-        "System.TimeZoneInfo.",
-        "System.WeakReference<",
+        "Scalar.AspNetCore.",
+
+        "System.",
     ];
 
     static bool IsTargetName(string name)
@@ -264,5 +255,27 @@ sealed class HeapInfoCapture(ILogger<HeapInfoCapture> logger, IHostEnvironment h
         }
 
         return true;
+    }
+}
+
+internal readonly struct ValueStopwatch
+{
+    private readonly long _startTimestamp;
+
+    public bool IsActive => _startTimestamp != 0;
+
+    private ValueStopwatch(long startTimestamp) => _startTimestamp = startTimestamp;
+
+    public static ValueStopwatch StartNew() => new(Stopwatch.GetTimestamp());
+
+    public TimeSpan GetElapsedTime()
+    {
+        if (!IsActive)
+        {
+            throw new InvalidOperationException("An uninitialized, or 'default', ValueStopwatch cannot be used to get elapsed time.");
+        }
+
+        var end = Stopwatch.GetTimestamp();
+        return Stopwatch.GetElapsedTime(_startTimestamp, end);
     }
 }
