@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Diagnostics.Metrics;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -9,30 +10,11 @@ using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using Scalar.AspNetCore;
 
-if (args.Contains("--heap-capture"))
+if (CaptureProcessHolder.TryBuildHeapCaptureApp(out var hcApp))
 {
-    Environment.SetEnvironmentVariable("ASPNETCORE_URLS", "http://+:10255");
-    Environment.SetEnvironmentVariable("ASPNETCORE_METER_NAME", Assembly.GetExecutingAssembly().GetName().Name + "-hc");
-
-    var hcBuilder = WebApplication.CreateBuilder(args);
-    var meterName = hcBuilder.Configuration.GetValue<string>("METER_NAME") ?? throw new ArgumentException("'METER_NAME' config is required");
-    hcBuilder.Logging.ClearProviders().AddSimpleConsole();
-    hcBuilder.Services
-        .AddHostedService<HeapInfoCapture>()
-        .AddSingleton<IAppMetrics, AppMetrics>()
-        .AddOpenTelemetry()
-        .WithMetrics(metrics => metrics
-            .ConfigureResource(resource => resource.AddService(serviceName: meterName))
-            .AddMeter(meterName)
-            .AddPrometheusExporter());
-
-    var hc = hcBuilder.Build();
-    hc.MapPrometheusScrapingEndpoint().RequireHost("*:10255");
-    await hc.RunAsync();
+    await hcApp.RunAsync();
     return;
 }
-
-Environment.SetEnvironmentVariable("ASPNETCORE_METER_NAME", Assembly.GetExecutingAssembly().GetName().Name);
 
 var appBuilder = WebApplication.CreateBuilder(args);
 
@@ -43,8 +25,7 @@ appBuilder.Logging
 
 appBuilder.Services.AddOpenApi();
 
-#region 建立 Meter 與 Counter 加入 OpenTelemetry 與 Prometheus Exporter
-
+// 建立 Meter 與 Counter 加入 OpenTelemetry 與 Prometheus Exporter
 appBuilder.Services
     .AddSingleton<IAppMetrics, AppMetrics>()
     .AddOpenTelemetry()
@@ -52,8 +33,6 @@ appBuilder.Services
         .ConfigureResource(resource => resource.AddService(serviceName: appBuilder.Environment.ApplicationName))
         .AddMeter(appBuilder.Environment.ApplicationName)
         .AddPrometheusExporter());
-
-#endregion
 
 appBuilder.Services
     .AddHostedService(p => p.GetRequiredService<CaptureProcessHolder>())
@@ -69,11 +48,8 @@ var app = appBuilder.Build();
 app.MapOpenApi();
 app.MapScalarApiReference();
 
-#region 註冊給 Prometheus 撈取資料的端點並限制 port
-
+// 註冊給 Prometheus 撈取資料的端點並限制 port
 app.MapPrometheusScrapingEndpoint().RequireHost("*:10254");
-
-#endregion
 
 const string ActionPath = "/action";
 app.MapGet(ActionPath, async ([FromServices] IAppMetrics metrics) =>
@@ -83,19 +59,14 @@ app.MapGet(ActionPath, async ([FromServices] IAppMetrics metrics) =>
 
     await Task.Delay(TimeSpan.FromMilliseconds(Random.Shared.Next(100, 300)));
 
-    #region 在需要的位置對 Counter 進行操作
-
     metrics.IncrementRequestCount(ActionPath);
     metrics.LogRequestHandleTime(ActionPath, (long)sw.GetElapsedTime().TotalMilliseconds);
-
-    #endregion
 
     return result;
 });
 
-app.MapPost("/toggle_fake_access", ([FromServices] ILogger<Program> logger, [FromServices] FakeAccess access, [FromBody] long toggle) =>
+app.MapPost("/toggle_fake_access", ([FromServices] FakeAccess access, [FromBody] long toggle) =>
 {
-    logger.LogInformation("toggle_fake_access: {toggle}", toggle);
     if (toggle == 0)
     {
         access.Pause();
@@ -106,9 +77,8 @@ app.MapPost("/toggle_fake_access", ([FromServices] ILogger<Program> logger, [Fro
     }
 });
 
-app.MapPost("/toggle_collect", ([FromServices] ILogger<Program> logger, [FromServices] CaptureProcessHolder holder, [FromBody] long toggle) =>
+app.MapPost("/toggle_collect", ([FromServices] CaptureProcessHolder holder, [FromBody] long toggle) =>
 {
-    logger.LogInformation("toggle_collect: {toggle}", toggle);
     if (toggle == 0)
     {
         holder.Pause();
@@ -135,10 +105,13 @@ internal sealed class AppMetrics : IAppMetrics
     {
         var name = configuration.GetValue<string>("METER_NAME") ?? throw new ArgumentException("'METER_NAME' config is required");
         var meter = meterFactory.Create(name, version: "1.0.0");
+
         _request = meter.CreateCounter<long>(name: "request.count", description: "Counts the number of request");
         _elapsedMs = meter.CreateGauge<long>(name: "request.elapsed", unit: "ms");
+
         _objectCount = meter.CreateGauge<long>(name: "obj.count");
         _objectSize = meter.CreateGauge<double>(name: "obj.size", unit: "bytes");
+
         _captureMs = meter.CreateGauge<long>(name: "capture.elapsed", unit: "ms");
         _capture = meter.CreateCounter<long>(name: "capture.count");
         _captureRestart = meter.CreateCounter<long>(name: "capture.restart");
@@ -208,14 +181,49 @@ internal sealed class FakeAccess(IHttpClientFactory clientFactory) : BackgroundS
     public void Resume() => Interlocked.Exchange(ref _pause, 0);
 }
 
+/// <summary>
+/// 因為反覆的在 docker 環境中執行 dotnet-dump collect 有可能會導致 process 崩潰
+/// 所以需要透過 subprocess 去執行再將指標匯出到獨立的 prometheus port
+/// </summary>
 internal sealed class CaptureProcessHolder(IAppMetrics appMetrics) : BackgroundService
 {
     private long _pause;
     private Process? _currentProcess;
 
+    private const string KeyArg = "--heap-capture";
+
+    public static bool TryBuildHeapCaptureApp([NotNullWhen(returnValue: true)] out WebApplication? heapCaptureApp)
+    {
+        var args = Environment.GetCommandLineArgs().Skip(1).ToArray();
+        if (args.Contains(KeyArg))
+        {
+            var appBuilder = WebApplication.CreateBuilder(args);
+            var meterName = appBuilder.Configuration.GetValue<string>("METER_NAME")
+                ?? throw new ArgumentException("'METER_NAME' config is required");
+            appBuilder.Logging.ClearProviders().AddSimpleConsole();
+            appBuilder.Services
+                .AddHostedService<HeapInfoCapture>()
+                .AddSingleton<IAppMetrics, AppMetrics>()
+                .AddOpenTelemetry()
+                .WithMetrics(metrics => metrics
+                    .ConfigureResource(resource => resource.AddService(serviceName: meterName))
+                    .AddMeter(meterName)
+                    .AddPrometheusExporter());
+
+            var app = appBuilder.Build();
+            app.MapPrometheusScrapingEndpoint().RequireHost("*:10255");
+            heapCaptureApp = app;
+            return true;
+        }
+        heapCaptureApp = null;
+        return false;
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var startInfo = new ProcessStartInfo("DockerAppDemo", ["--heap-capture"]) { RedirectStandardOutput = true };
+        var startInfo = new ProcessStartInfo("DockerAppDemo", [KeyArg]);
+        startInfo.Environment["ASPNETCORE_URLS"] = "http://+:10255";
+        startInfo.Environment["ASPNETCORE_METER_NAME"] = Assembly.GetExecutingAssembly().GetName().Name + "-hc";
         while (!stoppingToken.IsCancellationRequested)
         {
             try
