@@ -12,17 +12,18 @@ using Scalar.AspNetCore;
 if (args.Contains("--heap-capture"))
 {
     Environment.SetEnvironmentVariable("ASPNETCORE_URLS", "http://+:10255");
-    Environment.SetEnvironmentVariable("ASPNETCORE_ApplicationName", Assembly.GetExecutingAssembly().GetName().Name + "-hc");
+    Environment.SetEnvironmentVariable("ASPNETCORE_METER_NAME", Assembly.GetExecutingAssembly().GetName().Name + "-hc");
 
     var hcBuilder = WebApplication.CreateBuilder(args);
+    var meterName = hcBuilder.Configuration.GetValue<string>("METER_NAME") ?? throw new ArgumentException("'METER_NAME' config is required");
     hcBuilder.Logging.ClearProviders().AddSimpleConsole();
     hcBuilder.Services
         .AddHostedService<HeapInfoCapture>()
         .AddSingleton<IAppMetrics, AppMetrics>()
         .AddOpenTelemetry()
         .WithMetrics(metrics => metrics
-            .ConfigureResource(resource => resource.AddService(serviceName: hcBuilder.Environment.ApplicationName))
-            .AddMeter(hcBuilder.Environment.ApplicationName)
+            .ConfigureResource(resource => resource.AddService(serviceName: meterName))
+            .AddMeter(meterName)
             .AddPrometheusExporter());
 
     var hc = hcBuilder.Build();
@@ -30,6 +31,8 @@ if (args.Contains("--heap-capture"))
     await hc.RunAsync();
     return;
 }
+
+Environment.SetEnvironmentVariable("ASPNETCORE_METER_NAME", Assembly.GetExecutingAssembly().GetName().Name);
 
 var appBuilder = WebApplication.CreateBuilder(args);
 
@@ -52,11 +55,14 @@ appBuilder.Services
 
 #endregion
 
-appBuilder.Services.AddHostedService<CaptureProcessHolder>();
+appBuilder.Services
+    .AddHostedService(p => p.GetRequiredService<CaptureProcessHolder>())
+    .AddSingleton<CaptureProcessHolder>();
 
 appBuilder.Services
+    .AddHttpClient(nameof(FakeAccess), client => client.BaseAddress = new("http://localhost:7071/")).Services
     .AddHostedService(p => p.GetRequiredService<FakeAccess>())
-    .AddHttpClient<FakeAccess>(client => client.BaseAddress = new("http://localhost:10254/"));
+    .AddSingleton<FakeAccess>();
 
 var app = appBuilder.Build();
 
@@ -87,6 +93,32 @@ app.MapGet(ActionPath, async ([FromServices] IAppMetrics metrics) =>
     return result;
 });
 
+app.MapPost("/toggle_fake_access", ([FromServices] ILogger<Program> logger, [FromServices] FakeAccess access, [FromBody] long toggle) =>
+{
+    logger.LogInformation("toggle_fake_access: {toggle}", toggle);
+    if (toggle == 0)
+    {
+        access.Pause();
+    }
+    else
+    {
+        access.Resume();
+    }
+});
+
+app.MapPost("/toggle_collect", ([FromServices] ILogger<Program> logger, [FromServices] CaptureProcessHolder holder, [FromBody] long toggle) =>
+{
+    logger.LogInformation("toggle_collect: {toggle}", toggle);
+    if (toggle == 0)
+    {
+        holder.Pause();
+    }
+    else
+    {
+        holder.Resume();
+    }
+});
+
 await app.RunAsync();
 
 internal sealed class AppMetrics : IAppMetrics
@@ -99,9 +131,10 @@ internal sealed class AppMetrics : IAppMetrics
     private readonly Counter<long> _capture;
     private readonly Counter<long> _captureRestart;
 
-    public AppMetrics(IHostEnvironment hostEnvironment, IMeterFactory meterFactory)
+    public AppMetrics(IConfiguration configuration, IMeterFactory meterFactory)
     {
-        var meter = meterFactory.Create(name: hostEnvironment.ApplicationName, version: "1.0.0");
+        var name = configuration.GetValue<string>("METER_NAME") ?? throw new ArgumentException("'METER_NAME' config is required");
+        var meter = meterFactory.Create(name, version: "1.0.0");
         _request = meter.CreateCounter<long>(name: "request.count", description: "Counts the number of request");
         _elapsedMs = meter.CreateGauge<long>(name: "request.elapsed", unit: "ms");
         _objectCount = meter.CreateGauge<long>(name: "obj.count");
@@ -143,37 +176,89 @@ internal interface IAppMetrics
     void IncrementCaptureRestartCount();
 }
 
-internal sealed class FakeAccess(HttpClient client) : BackgroundService
+internal sealed class FakeAccess(IHttpClientFactory clientFactory) : BackgroundService
 {
+    private long _pause;
+
+    private readonly HttpClient _client = clientFactory.CreateClient(nameof(FakeAccess));
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        await Task.Delay(TimeSpan.FromSeconds(3), stoppingToken);
+
         while (!stoppingToken.IsCancellationRequested)
         {
-            await Task.Delay(TimeSpan.FromMilliseconds(Random.Shared.Next(3000, 12000)), stoppingToken);
+            if (Interlocked.Read(ref _pause) == 0)
+            {
+                try
+                {
+                    _ = _client.GetAsync("action", stoppingToken);
+                }
+                catch (TaskCanceledException)
+                {
+                }
+            }
 
-            _ = client.GetAsync("action", stoppingToken);
+            await Task.Delay(TimeSpan.FromMilliseconds(Random.Shared.Next(3000, 12000)), stoppingToken);
         }
     }
+
+    public void Pause() => Interlocked.Exchange(ref _pause, 1);
+
+    public void Resume() => Interlocked.Exchange(ref _pause, 0);
 }
 
 internal sealed class CaptureProcessHolder(IAppMetrics appMetrics) : BackgroundService
 {
+    private long _pause;
+    private Process? _currentProcess;
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var startInfo = new ProcessStartInfo("DockerAppDemo", ["--heap-capture"]);
+        var startInfo = new ProcessStartInfo("DockerAppDemo", ["--heap-capture"]) { RedirectStandardOutput = true };
         while (!stoppingToken.IsCancellationRequested)
         {
-            using var subprocess = Process.Start(startInfo)!;
-            await subprocess.WaitForExitAsync(stoppingToken);
-
-            if (subprocess.ExitCode == 0)
+            try
             {
-                break;
+                while (Interlocked.Read(ref _pause) > 0)
+                {
+                    await Task.Delay(33, stoppingToken);
+                }
+
+                var process = Process.Start(startInfo)!;
+
+                _currentProcess = process;
+
+                await process.WaitForExitAsync(stoppingToken);
+
+                if (process.ExitCode == 0)
+                {
+                    break;
+                }
+            }
+            finally
+            {
+                _currentProcess = null;
             }
 
             appMetrics.IncrementCaptureRestartCount();
         }
     }
+
+    public void Pause()
+    {
+        if (Interlocked.CompareExchange(ref _pause, value: 1, comparand: 0) == 0)
+        {
+            if (_currentProcess is { } process)
+            {
+                process.Kill();
+                process.Dispose();
+                _currentProcess = null;
+            }
+        }
+    }
+
+    public void Resume() => Interlocked.Exchange(ref _pause, 0);
 }
 
 internal sealed class HeapInfoCapture(IHostEnvironment hostEnvironment, IAppMetrics appMetrics) : BackgroundService
@@ -240,7 +325,7 @@ internal sealed class HeapInfoCapture(IHostEnvironment hostEnvironment, IAppMetr
     {
         foreach (var prefix in IgnorePrefix)
         {
-            if (name.AsSpan().StartsWith(prefix, StringComparison.Ordinal))
+            if (name.AsSpan().StartsWith(prefix))
             {
                 return false;
             }
