@@ -182,10 +182,10 @@ internal sealed class FakeAccess(IHttpClientFactory clientFactory) : BackgroundS
 }
 
 /// <summary>
-/// 因為反覆的在 docker 環境中執行 dotnet-dump collect 有可能會導致 process 崩潰
-/// 所以需要透過 subprocess 去執行再將指標匯出到獨立的 prometheus port
+/// 因為反覆的在 docker 環境中執行 dotnet-dump collect 有可能會導致於任何錯誤輸出的 process 崩潰 (exit code 139)
+/// 所以需要透過 subprocess 去執行; 再將指標匯出到獨立的 prometheus port
 /// </summary>
-internal sealed class CaptureProcessHolder(IAppMetrics appMetrics) : BackgroundService
+internal sealed class CaptureProcessHolder(ILogger<CaptureProcessHolder> logger, IAppMetrics appMetrics) : BackgroundService
 {
     private long _pause;
     private Process? _currentProcess;
@@ -224,6 +224,7 @@ internal sealed class CaptureProcessHolder(IAppMetrics appMetrics) : BackgroundS
         var startInfo = new ProcessStartInfo("DockerAppDemo", [KeyArg]);
         startInfo.Environment["ASPNETCORE_URLS"] = "http://+:10255";
         startInfo.Environment["ASPNETCORE_METER_NAME"] = Assembly.GetExecutingAssembly().GetName().Name + "-hc";
+        startInfo.Environment["DOTNET_gcServer"] = "0";
         while (!stoppingToken.IsCancellationRequested)
         {
             try
@@ -238,6 +239,8 @@ internal sealed class CaptureProcessHolder(IAppMetrics appMetrics) : BackgroundS
                 _currentProcess = process;
 
                 await process.WaitForExitAsync(stoppingToken);
+
+                logger.LogInformation("Capture subprocess exit: {code}", process.ExitCode);
 
                 if (process.ExitCode == 0)
                 {
@@ -271,80 +274,78 @@ internal sealed class CaptureProcessHolder(IAppMetrics appMetrics) : BackgroundS
 
 internal sealed class HeapInfoCapture(IHostEnvironment hostEnvironment, IAppMetrics appMetrics) : BackgroundService
 {
+    sealed class Meta(ulong size, uint count)
+    {
+        public ulong Size { get; set; } = size;
+        public uint Count { get; set; } = count;
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var executorPath = await EnsureDumpExecutorAsync(stoppingToken);
+        var captureIntervalMs = (long)TimeSpan.FromSeconds(30).TotalMilliseconds;
+
+        var type2count = new Dictionary<ClrType, Meta>(EqualityComparer<ClrType>.Create(
+            equals: (a, b) => a!.Name!.Equals(b!.Name),
+            getHashCode: a => a.Name!.GetHashCode()));
+
+        var executorPath = await EnsureDumpExecutorAsync(hostEnvironment.ContentRootPath, stoppingToken);
+        var dumpfile = Path.Combine(hostEnvironment.ContentRootPath, "HeapInfoCapture.dmp");
+        var startInfo = new ProcessStartInfo(executorPath, ["collect", "-o", dumpfile, "-p", "1"]);
 
         await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
 
-        var cd = hostEnvironment.ContentRootPath;
-        var dumpfile = Path.Combine(cd, "HeapInfoCapture.dmp");
-        var startInfo = new ProcessStartInfo(executorPath, ["collect", "-o", dumpfile, "-p", "1"]);
         while (!stoppingToken.IsCancellationRequested)
         {
-            var vsw = ValueStopwatch.StartNew();
+            var sw = ValueStopwatch.StartNew();
 
             using (var collect = Process.Start(startInfo)!)
             {
                 await collect.WaitForExitAsync(stoppingToken);
             }
 
-            using (var target = DataTarget.LoadDump(dumpfile))
-            using (var runtime = target.ClrVersions[0].CreateRuntime())
-            {
-                var groups = runtime.Heap.EnumerateObjects()
-                    .Where(o => o.Type?.Name is { } name && IsTargetName(name))
-                    .GroupBy(o => o.Type!);
-                foreach (var group in groups)
-                {
-                    ulong totalSize = 0;
-                    uint count = 0;
-                    foreach (var obj in group)
-                    {
-                        totalSize += obj.Size;
-                        ++count;
-                    }
-                    appMetrics.LogHeapObject(group.Key, count, totalSize);
-                }
-            }
+            ReadDumpFile(dumpfile, type2count);
 
             File.Delete(dumpfile);
 
-            var elapsed = (long)vsw.GetElapsedTime().TotalMilliseconds;
-            appMetrics.LogCaptureTime(elapsed);
+            foreach (var (type, meta) in type2count)
+            {
+                appMetrics.LogHeapObject(type, meta.Count, meta.Size);
+                (meta.Size, meta.Count) = (0, 0);
+            }
+
+            var captureElapsedMs = (long)sw.GetElapsedTime().TotalMilliseconds;
+            appMetrics.LogCaptureTime(captureElapsedMs);
             appMetrics.IncrementCaptureCount();
 
-            await Task.Delay(TimeSpan.FromSeconds(30) - TimeSpan.FromMilliseconds(elapsed), stoppingToken);
+            await Task.Delay((int)(captureIntervalMs - captureElapsedMs), stoppingToken);
         }
     }
 
-    private static readonly string[] IgnorePrefix = [
-        "<>",
-
-        "Internal.",
-        "Interop+",
-
-        "OpenTelemetry.",
-
-        "Scalar.AspNetCore.",
-    ];
-
-    private static bool IsTargetName(string name)
+    private static void ReadDumpFile(string dumpfile, IDictionary<ClrType, Meta> type2count)
     {
-        foreach (var prefix in IgnorePrefix)
+        using var target = DataTarget.LoadDump(dumpfile);
+        using var runtime = target.ClrVersions[0].CreateRuntime();
+        foreach (var obj in runtime.Heap.EnumerateObjects())
         {
-            if (name.AsSpan().StartsWith(prefix))
+            if (obj.Type is not { } type || type.Name is not { Length: > 0 })
             {
-                return false;
+                continue;
             }
-        }
 
-        return true;
+            if (!type2count.TryGetValue(type, out var meta))
+            {
+                meta = new(0, 0);
+                type2count.Add(type, meta);
+            }
+
+            meta.Size += obj.Size;
+            meta.Count += 1;
+        }
     }
 
-    private async ValueTask<string> EnsureDumpExecutorAsync(CancellationToken cancellationToken)
+    private static async ValueTask<string> EnsureDumpExecutorAsync(string folderPath, CancellationToken cancellationToken)
     {
-        var executor = Path.Combine(hostEnvironment.ContentRootPath, "dotnet-dump");
+        var executor = Path.Combine(folderPath, "dotnet-dump");
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
             executor += ".exe";
