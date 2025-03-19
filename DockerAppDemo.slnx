@@ -6,8 +6,6 @@
         <Project Path="src/DockerAppDemo/DockerAppDemo.csproj" />
     </Folder>
 
-    <Project Path="DockerAppDemo/DockerAppDemo.csproj" />
-
     <!-- Support is provisionally available on Visual Studio 17.10 and later versions. -->
     <Properties Name="Visual Studio">
         <Property Name="OpenWith" Value="17" />
