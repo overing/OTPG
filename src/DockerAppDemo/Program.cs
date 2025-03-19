@@ -290,7 +290,7 @@ internal sealed class HeapInfoCapture(IHostEnvironment hostEnvironment, IAppMetr
 
         var executorPath = await EnsureDumpExecutorAsync(hostEnvironment.ContentRootPath, stoppingToken);
         var dumpfile = Path.Combine(hostEnvironment.ContentRootPath, "HeapInfoCapture.dmp");
-        var startInfo = new ProcessStartInfo(executorPath, ["collect", "-o", dumpfile, "-p", "1"]);
+        var startInfo = new ProcessStartInfo(executorPath, ["collect", "--type", "Heap", "-p", "1", "-o", dumpfile]);
 
         await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
 
