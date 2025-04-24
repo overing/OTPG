@@ -54,7 +54,7 @@ app.MapPrometheusScrapingEndpoint().RequireHost("*:10254");
 const string ActionPath = "/action";
 app.MapGet(ActionPath, async ([FromServices] IAppMetrics metrics, [FromServices] ILogger<Program> logger) =>
 {
-    logger.LogInformation("Handle GET /Action");
+    // logger.LogInformation("Handle GET /Action");
 
     var sw = ValueStopwatch.StartNew();
     var result = Results.Ok("Is work !! :D");
@@ -137,12 +137,12 @@ internal sealed class AppMetrics : IAppMetrics
 
     public void LogRequestHandleTime(string name, long ms) => _elapsedMs.Record(ms, [new("action", name)]);
 
-    public void LogHeapObject(ClrType type, uint count, ulong size)
+    public void LogHeapObject(TypeInfo info, uint count, ulong size)
     {
         var tags = new KeyValuePair<string, object?>[2]
         {
-            new("type", type.Name),
-            new("assembly", type.Module.AssemblyName),
+            new("type", info.Name),
+            new("assembly", info.AssemblyName),
         };
         _objectCount.Record(count, tags);
         _objectSize.Record(size, tags);
@@ -160,7 +160,7 @@ internal interface IAppMetrics
     void Startup();
     void IncrementRequestCount(string name);
     void LogRequestHandleTime(string name, long ms);
-    void LogHeapObject(ClrType type, uint count, ulong size);
+    void LogHeapObject(TypeInfo type, uint count, ulong size);
     void LogCaptureTime(long ms);
     void IncrementCaptureCount();
     void IncrementCaptureRestartCount();
@@ -206,7 +206,7 @@ internal sealed class FakeAccess(IHttpClientFactory clientFactory, ILogger<FakeA
 }
 
 /// <summary>
-/// 因為反覆的在 docker 環境中執行 dotnet-dump collect 有可能會導致於任何錯誤輸出的 process 崩潰 (exit code 139)
+/// 因為希望擷取 dump 資料本身的動作不要影響擷取的結果
 /// 所以需要透過 subprocess 去執行; 再將指標匯出到獨立的 prometheus port
 /// </summary>
 internal sealed class CaptureProcessHolder(ILogger<CaptureProcessHolder> logger, IAppMetrics appMetrics) : BackgroundService
@@ -296,7 +296,12 @@ internal sealed class CaptureProcessHolder(ILogger<CaptureProcessHolder> logger,
     public void Resume() => Interlocked.Exchange(ref _pause, 0);
 }
 
-internal sealed class HeapInfoCapture(IHostEnvironment hostEnvironment, IAppMetrics appMetrics) : BackgroundService
+public sealed record class TypeInfo(string Name, string AssemblyName)
+{
+    public static TypeInfo FromClrType(ClrType type) => new(type.Name!, type.Module.AssemblyName!);
+}
+
+internal sealed class HeapInfoCapture(ILogger<HeapInfoCapture> logger, IHostEnvironment hostEnvironment, IAppMetrics appMetrics) : BackgroundService
 {
     sealed class Meta(ulong size, uint count)
     {
@@ -306,48 +311,71 @@ internal sealed class HeapInfoCapture(IHostEnvironment hostEnvironment, IAppMetr
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var captureIntervalMs = (long)TimeSpan.FromSeconds(30).TotalMilliseconds;
-
-        var type2count = new Dictionary<ClrType, Meta>(EqualityComparer<ClrType>.Create(
-            equals: (a, b) => a!.Name!.Equals(b!.Name),
-            getHashCode: a => a.Name!.GetHashCode()));
-
         var executorPath = await EnsureDumpExecutorAsync(hostEnvironment.ContentRootPath, stoppingToken);
         var dumpfile = Path.Combine(hostEnvironment.ContentRootPath, "HeapInfoCapture.dmp");
         var startInfo = new ProcessStartInfo(executorPath, ["collect", "--type", "Heap", "-p", "1", "-o", dumpfile]);
 
         await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
 
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            var sw = ValueStopwatch.StartNew();
-
-            using (var collect = Process.Start(startInfo)!)
-            {
-                await collect.WaitForExitAsync(stoppingToken);
-            }
-
-            ReadDumpFile(dumpfile, type2count);
-
-            File.Delete(dumpfile);
-
-            foreach (var (type, meta) in type2count)
-            {
-                appMetrics.LogHeapObject(type, meta.Count, meta.Size);
-                (meta.Size, meta.Count) = (0, 0);
-            }
-
-            var captureElapsedMs = (long)sw.GetElapsedTime().TotalMilliseconds;
-            appMetrics.LogCaptureTime(captureElapsedMs);
-            appMetrics.IncrementCaptureCount();
-
-            await Task.Delay((int)(captureIntervalMs - captureElapsedMs), stoppingToken);
-        }
+        ThreadPool.QueueUserWorkItem(TryExec, startInfo);
     }
 
-    private static void ReadDumpFile(string dumpfile, IDictionary<ClrType, Meta> type2count)
+    void TryExec(object? status)
     {
-        using var target = DataTarget.LoadDump(dumpfile);
+        try
+        {
+            Exec(status);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Capture subprocess faulted: {message}", ex.Message);
+        }
+        Thread.Sleep(TimeSpan.FromSeconds(30));
+        ThreadPool.QueueUserWorkItem(TryExec, status);
+    }
+
+    readonly Dictionary<TypeInfo, Meta> Type2count = new(EqualityComparer<TypeInfo>.Create(
+        equals: (a, b) => a!.Name!.Equals(b!.Name),
+        getHashCode: a => a.Name!.GetHashCode()));
+
+    void Exec(object? status)
+    {
+        var startInfo = (status as ProcessStartInfo)!;
+        var dumpfile = startInfo.ArgumentList.Last();
+
+        var sw = ValueStopwatch.StartNew();
+
+        using (var collect = Process.Start(startInfo)!)
+        {
+            collect.WaitForExit();
+        }
+
+        if (!File.Exists(dumpfile))
+        {
+            return;
+        }
+
+        Type2count.Clear();
+
+        ReadDumpFile(dumpfile, Type2count);
+
+        File.Delete(dumpfile);
+
+        foreach (var (info, meta) in Type2count)
+        {
+            appMetrics.LogHeapObject(info, meta.Count, meta.Size);
+            (meta.Size, meta.Count) = (0, 0);
+        }
+
+        var captureElapsedMs = (long)sw.GetElapsedTime().TotalMilliseconds;
+        appMetrics.LogCaptureTime(captureElapsedMs);
+        appMetrics.IncrementCaptureCount();
+    }
+
+    private static void ReadDumpFile(string dumpfile, IDictionary<TypeInfo, Meta> type2count)
+    {
+        using var stream = File.OpenRead(dumpfile);
+        using var target = DataTarget.LoadDump(dumpfile, stream);
         using var runtime = target.ClrVersions[0].CreateRuntime();
         foreach (var obj in runtime.Heap.EnumerateObjects())
         {
@@ -356,10 +384,11 @@ internal sealed class HeapInfoCapture(IHostEnvironment hostEnvironment, IAppMetr
                 continue;
             }
 
-            if (!type2count.TryGetValue(type, out var meta))
+            var info = TypeInfo.FromClrType(type);
+            if (!type2count.TryGetValue(info, out var meta))
             {
                 meta = new(0, 0);
-                type2count.Add(type, meta);
+                type2count.Add(info, meta);
             }
 
             meta.Size += obj.Size;
