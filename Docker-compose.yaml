@@ -24,11 +24,11 @@ services:
       # 如果使用 https ...
       # 需要先依照官方說明在 Docker Host 環境產生開發用證書
       # https://learn.microsoft.com/en-us/aspnet/core/security/docker-compose-https?view=aspnetcore-8.0
-      # 再使用以下兩條設定將證書帶入
-      ASPNETCORE_Kestrel__Certificates__Default__Path: "/https/aspnetapp.pfx"
-      ASPNETCORE_Kestrel__Certificates__Default__Password: "abc123"
-    volumes:
-      - ~/.aspnet/https:/https:ro
+      # 再掛載 host 的證書資料夾進容器並使用以下兩條環境變數設定將證書帶入
+      # ASPNETCORE_Kestrel__Certificates__Default__Path: "/https/aspnetapp.pfx"
+      # ASPNETCORE_Kestrel__Certificates__Default__Password: "abc123"
+    # volumes:
+    #   - ~/.aspnet/https:/https:ro
 
     ports:
       - '7071:7071'
