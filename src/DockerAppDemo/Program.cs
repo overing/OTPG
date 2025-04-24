@@ -52,8 +52,10 @@ app.MapScalarApiReference();
 app.MapPrometheusScrapingEndpoint().RequireHost("*:10254");
 
 const string ActionPath = "/action";
-app.MapGet(ActionPath, async ([FromServices] IAppMetrics metrics) =>
+app.MapGet(ActionPath, async ([FromServices] IAppMetrics metrics, [FromServices] ILogger<Program> logger) =>
 {
+    logger.LogInformation("Handle GET /Action");
+
     var sw = ValueStopwatch.StartNew();
     var result = Results.Ok("Is work !! :D");
 
@@ -89,6 +91,11 @@ app.MapPost("/toggle_collect", ([FromServices] CaptureProcessHolder holder, [Fro
     }
 });
 
+app.Services.GetRequiredService<IHostApplicationLifetime>().ApplicationStarted.Register(() =>
+{
+    app.Services.GetRequiredService<IAppMetrics>().Startup();
+});
+
 await app.RunAsync();
 
 internal sealed class AppMetrics : IAppMetrics
@@ -117,6 +124,15 @@ internal sealed class AppMetrics : IAppMetrics
         _captureRestart = meter.CreateCounter<long>(name: "capture.restart");
     }
 
+    public void Startup()
+    {
+        _request.Add(0);
+        _objectCount.Record(0);
+        _objectSize.Record(0);
+        _capture.Add(0);
+        _captureRestart.Add(0);
+    }
+
     public void IncrementRequestCount(string name) => _request.Add(1, [new("action", name)]);
 
     public void LogRequestHandleTime(string name, long ms) => _elapsedMs.Record(ms, [new("action", name)]);
@@ -141,6 +157,7 @@ internal sealed class AppMetrics : IAppMetrics
 
 internal interface IAppMetrics
 {
+    void Startup();
     void IncrementRequestCount(string name);
     void LogRequestHandleTime(string name, long ms);
     void LogHeapObject(ClrType type, uint count, ulong size);
@@ -149,7 +166,7 @@ internal interface IAppMetrics
     void IncrementCaptureRestartCount();
 }
 
-internal sealed class FakeAccess(IHttpClientFactory clientFactory) : BackgroundService
+internal sealed class FakeAccess(IHttpClientFactory clientFactory, ILogger<FakeAccess> logger) : BackgroundService
 {
     private long _pause;
 
@@ -157,22 +174,29 @@ internal sealed class FakeAccess(IHttpClientFactory clientFactory) : BackgroundS
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        var interval = TimeSpan.FromSeconds(2);
+
         await Task.Delay(TimeSpan.FromSeconds(3), stoppingToken);
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            var sw = ValueStopwatch.StartNew();
+
             if (Interlocked.Read(ref _pause) == 0)
             {
                 try
                 {
-                    _ = _client.GetAsync("action", stoppingToken);
+                    _ = _client.GetAsync("action", stoppingToken)
+                        .ContinueWith((t, _) => logger.LogError(t.Exception!.Flatten().InnerException, "request faulted"), TaskContinuationOptions.OnlyOnFaulted, stoppingToken);
                 }
-                catch (TaskCanceledException)
+                catch (Exception)
                 {
                 }
             }
 
-            await Task.Delay(TimeSpan.FromMilliseconds(Random.Shared.Next(3000, 12000)), stoppingToken);
+            var elapsed = sw.GetElapsedTime();
+            var remMs = Math.Max((interval - elapsed).TotalMilliseconds, 0);
+            await Task.Delay(TimeSpan.FromMilliseconds(remMs), stoppingToken);
         }
     }
 

@@ -18,7 +18,7 @@ services:
         ENTRYPOINT ["./DockerAppDemo"]
     environment:
       DOTNET_gcServer: 1
-      ASPNETCORE_URLS: "https://+:7071;http://+:10254"
+      ASPNETCORE_URLS: "http://+:7071;http://+:10254"
       ASPNETCORE_METER_NAME: "DockerAppDemo"
 
       # 如果使用 https ...
@@ -41,6 +41,7 @@ services:
     configs:
       - source: prometheus.yaml
         target: /etc/prometheus/prometheus.yaml
+    user: root
     volumes:
       - ./Docker-data-volumes/prometheus:/prometheus
     command:
@@ -62,8 +63,11 @@ services:
     configs:
       - source: grafana_datasources.yaml
         target: /etc/grafana/provisioning/datasources/datasources.yaml
+      - source: grafana_dashboards.yaml
+        target: /etc/grafana/provisioning/dashboards/dashboards.yaml
     volumes:
       - ./Docker-data-volumes/grafana:/var/lib/grafana
+      - ./Grafana-dashboard.json:/etc/dashboards/Grafana-dashboard.json
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: grafana-admin
@@ -93,6 +97,7 @@ configs:
       apiVersion: 1
       datasources:
         - name: Prometheus
+          uid: prometheusdatasource # 這個 uid 會在 Grafana-dashboard.json 中用到
           type: prometheus
           url: http://host.docker.internal:9090 # docker 當中的 app host 需用 'host.docker.internal'
           access: proxy
@@ -100,3 +105,13 @@ configs:
           jsonData:
             timeInterval: "3s" # 展示用環境刻意將查詢間隔條短
             queryTimeout: "10s"
+
+  grafana_dashboards.yaml:
+    content: |
+      apiVersion: 1
+      providers:
+        - name: dashboards
+          type: file
+          updateIntervalSeconds: 30
+          options:
+            path: /etc/dashboards/Grafana-dashboard.json
