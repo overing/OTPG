@@ -10,7 +10,7 @@ appBuilder.Services.AddSingleton<IList<Order>, List<Order>>();
 var app = appBuilder.Build();
 
 app.MapOpenApi();
-app.MapScalarApiReference();
+app.MapScalarApiReference(endpointPrefix: "/");
 
 app.MapPost("/api/add_order", ([FromServices] IList<Order> orderCollection, [FromBody] AddOrderParam param) =>
 {
@@ -31,12 +31,7 @@ app.MapPost("/api/dump", () =>
     return Results.Ok(filename);
 });
 
-app.Services.GetRequiredService<IHostApplicationLifetime>().ApplicationStarted.Register(() =>
-{
-    System.Diagnostics.Process.Start(startInfo: new("http://localhost:5000/scalar/") { UseShellExecute = true });
-});
-
-await app.RunAsync("http://localhost:5000/");
+await app.RunAsync(url: "http://localhost:5000/");
 
 record class AddOrderParam(string ProductId = "product#1001", ushort Count = 1);
 
