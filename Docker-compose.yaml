@@ -19,7 +19,6 @@ services:
     environment:
       DOTNET_gcServer: 1
       ASPNETCORE_URLS: "http://+:7071;http://+:10254"
-      ASPNETCORE_METER_NAME: "DockerAppDemo"
 
       # 如果使用 https ...
       # 需要先依照官方說明在 Docker Host 環境產生開發用證書

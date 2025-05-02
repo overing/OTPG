@@ -34,14 +34,11 @@ appBuilder.Services
         .AddMeter(appBuilder.Environment.ApplicationName)
         .AddPrometheusExporter());
 
-appBuilder.Services
-    .AddHostedService(p => p.GetRequiredService<CaptureProcessHolder>())
-    .AddSingleton<CaptureProcessHolder>();
+ appBuilder.Services
+     .AddHostedService(p => p.GetRequiredService<CaptureProcessHolder>())
+     .AddSingleton<CaptureProcessHolder>();
 
-appBuilder.Services
-    .AddHttpClient(nameof(FakeAccess), client => client.BaseAddress = new("http://localhost:7071/")).Services
-    .AddHostedService(p => p.GetRequiredService<FakeAccess>())
-    .AddSingleton<FakeAccess>();
+appBuilder.Services.AddSingleton<IList<Order>, List<Order>>();
 
 var app = appBuilder.Build();
 
@@ -51,44 +48,22 @@ app.MapScalarApiReference();
 // 註冊給 Prometheus 撈取資料的端點並限制 port
 app.MapPrometheusScrapingEndpoint().RequireHost("*:10254");
 
-const string ActionPath = "/action";
-app.MapGet(ActionPath, async ([FromServices] IAppMetrics metrics, [FromServices] ILogger<Program> logger) =>
+app.MapGet("/", () => Results.Redirect("/scalar/", permanent: true));
+
+app.MapPost("/add_order", ([FromServices] IList<Order> orderCollection, [FromBody] AddOrderParam param) =>
 {
-    // logger.LogInformation("Handle GET /Action");
-
-    var sw = ValueStopwatch.StartNew();
-    var result = Results.Ok("Is work !! :D");
-
-    await Task.Delay(TimeSpan.FromMilliseconds(Random.Shared.Next(100, 300)));
-
-    metrics.IncrementRequestCount(ActionPath);
-    metrics.LogRequestHandleTime(ActionPath, (long)sw.GetElapsedTime().TotalMilliseconds);
-
-    return result;
-});
-
-app.MapPost("/toggle_fake_access", ([FromServices] FakeAccess access, [FromBody] long toggle) =>
-{
-    if (toggle == 0)
+    if (param is { ProductId.Length: > 0, Count: > 0 })
     {
-        access.Pause();
+        orderCollection.Add(new Order(Guid.NewGuid(), param.ProductId, param.Count, DateTime.UtcNow));
+        return Results.Ok();
     }
-    else
-    {
-        access.Resume();
-    }
+
+    return Results.BadRequest();
 });
 
 app.MapPost("/toggle_collect", ([FromServices] CaptureProcessHolder holder, [FromBody] long toggle) =>
 {
-    if (toggle == 0)
-    {
-        holder.Pause();
-    }
-    else
-    {
-        holder.Resume();
-    }
+    ((toggle == 0) ? (Action)holder.Pause : holder.Resume)();
 });
 
 app.Services.GetRequiredService<IHostApplicationLifetime>().ApplicationStarted.Register(() =>
@@ -97,6 +72,10 @@ app.Services.GetRequiredService<IHostApplicationLifetime>().ApplicationStarted.R
 });
 
 await app.RunAsync();
+
+record class AddOrderParam(string ProductId, ushort Count);
+
+record class Order(Guid OrderId, string ProductId, ushort Count, DateTime OrderTime);
 
 internal sealed class AppMetrics : IAppMetrics
 {
@@ -110,7 +89,7 @@ internal sealed class AppMetrics : IAppMetrics
 
     public AppMetrics(IConfiguration configuration, IMeterFactory meterFactory)
     {
-        var name = configuration.GetValue<string>("METER_NAME") ?? throw new ArgumentException("'METER_NAME' config is required");
+        var name = configuration.GetValue<string>("METER_NAME") ?? Assembly.GetEntryAssembly()!.GetName().Name!;
         var meter = meterFactory.Create(name, version: "1.0.0");
 
         _request = meter.CreateCounter<long>(name: "request.count", description: "Counts the number of request");
@@ -158,51 +137,10 @@ internal sealed class AppMetrics : IAppMetrics
 internal interface IAppMetrics
 {
     void Startup();
-    void IncrementRequestCount(string name);
-    void LogRequestHandleTime(string name, long ms);
     void LogHeapObject(TypeInfo type, uint count, ulong size);
     void LogCaptureTime(long ms);
     void IncrementCaptureCount();
     void IncrementCaptureRestartCount();
-}
-
-internal sealed class FakeAccess(IHttpClientFactory clientFactory, ILogger<FakeAccess> logger) : BackgroundService
-{
-    private long _pause;
-
-    private readonly HttpClient _client = clientFactory.CreateClient(nameof(FakeAccess));
-
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        var interval = TimeSpan.FromSeconds(2);
-
-        await Task.Delay(TimeSpan.FromSeconds(3), stoppingToken);
-
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            var sw = ValueStopwatch.StartNew();
-
-            if (Interlocked.Read(ref _pause) == 0)
-            {
-                try
-                {
-                    _ = _client.GetAsync("action", stoppingToken)
-                        .ContinueWith((t, _) => logger.LogError(t.Exception!.Flatten().InnerException, "request faulted"), TaskContinuationOptions.OnlyOnFaulted, stoppingToken);
-                }
-                catch (Exception)
-                {
-                }
-            }
-
-            var elapsed = sw.GetElapsedTime();
-            var remMs = Math.Max((interval - elapsed).TotalMilliseconds, 0);
-            await Task.Delay(TimeSpan.FromMilliseconds(remMs), stoppingToken);
-        }
-    }
-
-    public void Pause() => Interlocked.Exchange(ref _pause, 1);
-
-    public void Resume() => Interlocked.Exchange(ref _pause, 0);
 }
 
 /// <summary>
@@ -214,19 +152,18 @@ internal sealed class CaptureProcessHolder(ILogger<CaptureProcessHolder> logger,
     private long _pause;
     private Process? _currentProcess;
 
-    private const string KeyArg = "--heap-capture";
+    private const string KeyArg = "--heap-capture-pid=";
 
     public static bool TryBuildHeapCaptureApp([NotNullWhen(returnValue: true)] out WebApplication? heapCaptureApp)
     {
         var args = Environment.GetCommandLineArgs().Skip(1).ToArray();
-        if (args.Contains(KeyArg))
+        if (args.FirstOrDefault(a => a.StartsWith(KeyArg)) is { } pidArg && ulong.TryParse(pidArg[KeyArg.Length..], out var pid))
         {
             var appBuilder = WebApplication.CreateBuilder(args);
-            var meterName = appBuilder.Configuration.GetValue<string>("METER_NAME")
-                ?? throw new ArgumentException("'METER_NAME' config is required");
+            var meterName = appBuilder.Configuration.GetValue<string>("METER_NAME") ?? Assembly.GetEntryAssembly()!.GetName().Name!;
             appBuilder.Logging.ClearProviders().AddSimpleConsole();
             appBuilder.Services
-                .AddHostedService<HeapInfoCapture>()
+                .AddHostedService(p => ActivatorUtilities.CreateInstance<HeapInfoCapture>(p, pid))
                 .AddSingleton<IAppMetrics, AppMetrics>()
                 .AddOpenTelemetry()
                 .WithMetrics(metrics => metrics
@@ -245,7 +182,7 @@ internal sealed class CaptureProcessHolder(ILogger<CaptureProcessHolder> logger,
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var startInfo = new ProcessStartInfo("DockerAppDemo", [KeyArg]);
+        var startInfo = new ProcessStartInfo("DockerAppDemo", [KeyArg + Environment.ProcessId]);
         startInfo.Environment["ASPNETCORE_URLS"] = "http://+:10255";
         startInfo.Environment["ASPNETCORE_METER_NAME"] = Assembly.GetExecutingAssembly().GetName().Name + "-hc";
         startInfo.Environment["DOTNET_gcServer"] = "0";
@@ -301,7 +238,7 @@ public sealed record class TypeInfo(string Name, string AssemblyName)
     public static TypeInfo FromClrType(ClrType type) => new(type.Name!, type.Module.AssemblyName!);
 }
 
-internal sealed class HeapInfoCapture(ILogger<HeapInfoCapture> logger, IHostEnvironment hostEnvironment, IAppMetrics appMetrics) : BackgroundService
+internal sealed class HeapInfoCapture(ILogger<HeapInfoCapture> logger, IHostEnvironment hostEnvironment, IHostApplicationLifetime lifetime, IAppMetrics appMetrics, ulong pid) : BackgroundService
 {
     sealed class Meta(ulong size, uint count)
     {
@@ -311,13 +248,25 @@ internal sealed class HeapInfoCapture(ILogger<HeapInfoCapture> logger, IHostEnvi
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        var process = Process.GetProcessById((int)pid);
         var executorPath = await EnsureDumpExecutorAsync(hostEnvironment.ContentRootPath, stoppingToken);
         var dumpfile = Path.Combine(hostEnvironment.ContentRootPath, "HeapInfoCapture.dmp");
-        var startInfo = new ProcessStartInfo(executorPath, ["collect", "--type", "Heap", "-p", "1", "-o", dumpfile]);
+        var startInfo = new ProcessStartInfo(executorPath, ["collect", "--type", "Heap", "-p", pid.ToString(), "-o", dumpfile]);
 
         await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
 
         ThreadPool.QueueUserWorkItem(TryExec, startInfo);
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            if (process.HasExited)
+            {
+                logger.LogInformation("Capture process is exit: {code}, will stop self", process.ExitCode);
+                lifetime.StopApplication();
+                break;
+            }
+            await Task.Delay(200, stoppingToken);
+        }
     }
 
     void TryExec(object? status)
