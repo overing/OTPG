@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
 using Scalar.AspNetCore;
 
@@ -26,14 +25,15 @@ app.MapPost("/api/add_order", ([FromServices] IList<Order> orderCollection, [Fro
 
 app.MapPost("/api/dump", () =>
 {
+    var pid = Environment.ProcessId;
     var filename = $"{DateTime.Now:yyMMdd-HHmmss}.dmp";
-    Process.Start(startInfo: new("dotnet-dump", arguments: $"collect -p {Environment.ProcessId} -o {filename}"));
+    System.Diagnostics.Process.Start(startInfo: new("dotnet-dump", arguments: $"collect -p {pid} -o {filename}"));
     return Results.Ok(filename);
 });
 
 app.Services.GetRequiredService<IHostApplicationLifetime>().ApplicationStarted.Register(() =>
 {
-    Process.Start(startInfo: new("http://localhost:5000/scalar/") { UseShellExecute = true });
+    System.Diagnostics.Process.Start(startInfo: new("http://localhost:5000/scalar/") { UseShellExecute = true });
 });
 
 await app.RunAsync("http://localhost:5000/");
