@@ -283,9 +283,7 @@ internal sealed class HeapInfoCapture(ILogger<HeapInfoCapture> logger, IHostEnvi
         ThreadPool.QueueUserWorkItem(TryExec, status);
     }
 
-    readonly Dictionary<TypeInfo, Meta> Type2count = new(EqualityComparer<TypeInfo>.Create(
-        equals: (a, b) => a!.Name!.Equals(b!.Name),
-        getHashCode: a => a.Name!.GetHashCode()));
+    readonly Dictionary<TypeInfo, Meta> Type2count = [];
 
     void Exec(object? status)
     {
@@ -312,6 +310,12 @@ internal sealed class HeapInfoCapture(ILogger<HeapInfoCapture> logger, IHostEnvi
 
         foreach (var (info, meta) in Type2count)
         {
+            if (info.Name.Equals("Order", StringComparison.OrdinalIgnoreCase) ||
+                info.Name.Equals("AddOrderParam", StringComparison.OrdinalIgnoreCase))
+            {
+                logger.LogInformation("++++++++++ Heap object: {type} {assembly} {size} {count}", info.Name, info.AssemblyName, meta.Count, meta.Size);
+            }
+
             appMetrics.LogHeapObject(info, meta.Count, meta.Size);
             (meta.Size, meta.Count) = (0, 0);
         }
@@ -321,7 +325,7 @@ internal sealed class HeapInfoCapture(ILogger<HeapInfoCapture> logger, IHostEnvi
         appMetrics.IncrementCaptureCount();
     }
 
-    private static void ReadDumpFile(string dumpfile, IDictionary<TypeInfo, Meta> type2count)
+    private void ReadDumpFile(string dumpfile, IDictionary<TypeInfo, Meta> type2count)
     {
         using var stream = File.OpenRead(dumpfile);
         using var target = DataTarget.LoadDump(dumpfile, stream);
